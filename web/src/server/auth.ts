@@ -1,3 +1,4 @@
+/* eslint-disable no-nested-ternary */
 import { type GetServerSidePropsContext } from "next";
 import {
   getServerSession,
@@ -14,9 +15,11 @@ import {
 import {
   parseFlags,
   parseFlagsWithOrganizationDefaults,
-} from "@/src/features/feature-flags/utils";
+} from "@/src/features/feature-flags/server";
+import { isGatewayEnabledForOrganization } from "@/src/features/ai-gateway/server/availability";
 import { env } from "@/src/env.mjs";
 import { createProjectMembershipsOnSignup } from "@/src/features/auth/lib/createProjectMembershipsOnSignup";
+import { getSessionLoginAt } from "@/src/features/auth/lib/sessionExpiration";
 import { type AdClickIds } from "@/src/features/auth/lib/signupAttribution";
 import {
   type AdapterUser,
@@ -51,7 +54,7 @@ import {
   findMultiTenantSsoConfig,
   getSsoAuthProviderIdForDomain,
   loadSsoProviders,
-} from "@/src/ee/features/multi-tenant-sso/utils";
+} from "@/src/ee/features/multi-tenant-sso/server";
 import {
   ENTERPRISE_SSO_REQUIRED_MESSAGE,
   MULTI_TENANT_SSO_DOMAIN_MISMATCH_MESSAGE,
@@ -78,8 +81,8 @@ import { createSupportEmailHash } from "@/src/features/support-chat/createSuppor
 import {
   canToggleV4,
   isV4UpgradeUiAvailable,
-} from "@/src/features/events/lib/v4Rollout";
-import { canCreateOrganizations } from "@/src/features/organizations/server/canCreateOrganizations";
+} from "@/src/features/events/server";
+import { canCreateOrganizations } from "@/src/features/organizations/server";
 
 const staticProviders: Provider[] = [
   CredentialsProvider({
@@ -750,11 +753,28 @@ export async function getAuthOptions(signupAttribution?: {
         }
         return baseUrl;
       },
+      async jwt({ token, user }) {
+        if (user) {
+          const loginAt = await getSessionLoginAt(token.email!);
+          token.loginAt = loginAt.getTime();
+        }
+        return token;
+      },
       async session({ session, token }): Promise<Session> {
         return instrumentAsync({ name: "next-auth-session" }, async (span) => {
           const dbUser = await prisma.user.findUnique({
             where: {
               email: token.email!.toLowerCase(),
+              OR: [
+                { sessionsExpiredAt: null },
+                {
+                  // Strict: a token issued in the same millisecond as revocation
+                  // is treated as revoked.
+                  sessionsExpiredAt: {
+                    lt: new Date(token.loginAt ?? 0),
+                  },
+                },
+              ],
             },
             select: {
               id: true,
@@ -912,6 +932,9 @@ export async function getAuthOptions(signupAttribution?: {
                             {
                               email: dbUser.email,
                               v4BetaEnabled,
+                              aiGatewayEnabled: isGatewayEnabledForOrganization(
+                                orgMembership.organization.id,
+                              ),
                             },
                           ),
                           cloudConfig: parsedCloudConfig.data,
